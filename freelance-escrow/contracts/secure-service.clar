@@ -17,6 +17,9 @@
 (define-constant ERROR_AGREEMENT_ALREADY_EXISTS (err u103))
 (define-constant ERROR_AGREEMENT_NOT_FOUND (err u104))
 (define-constant ERROR_INVALID_MILESTONE_INDEX (err u105))
+(define-constant ERROR_INVALID_INPUT (err u106))
+(define-constant ERROR_INVALID_SERVICE_PROVIDER (err u107))
+(define-constant ERROR_INVALID_MILESTONE_DATA (err u108))
 
 ;; Data structures
 (define-map service-agreement-details
@@ -98,6 +101,38 @@
     )
 )
 
+(define-private (validate-service-provider (provider principal))
+    (and 
+        (not (is-eq provider tx-sender))  ;; Provider cannot be the client
+        (not (is-eq provider contract-administrator))  ;; Provider cannot be the admin
+        (not (is-eq provider (as-contract tx-sender)))  ;; Provider cannot be the contract itself
+    )
+)
+
+(define-private (validate-milestone-payments (milestones (list 5 {
+        milestone-description: (string-utf8 100),
+        milestone-payment: uint,
+        milestone-completed: bool
+    })) 
+    (total-cost uint))
+    (let ((total-milestone-payments (+ 
+            (get milestone-payment (unwrap-panic (element-at milestones u0)))
+            (get milestone-payment (unwrap-panic (element-at milestones u1)))
+            (get milestone-payment (unwrap-panic (element-at milestones u2)))
+            (get milestone-payment (unwrap-panic (element-at milestones u3)))
+            (get milestone-payment (unwrap-panic (element-at milestones u4)))
+        )))
+        (and 
+            (is-eq total-milestone-payments total-cost)  ;; Sum of milestone payments must equal total cost
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u0)))) u0)  ;; Validate descriptions
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u1)))) u0)
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u2)))) u0)
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u3)))) u0)
+            (> (len (get milestone-description (unwrap-panic (element-at milestones u4)))) u0)
+        )
+    )
+)
+
 (define-private (update-milestone-at-index 
     (milestone {
         milestone-description: (string-utf8 100),
@@ -128,6 +163,9 @@
     (let ((current-block block-height))
         (asserts! (is-none (get-agreement-details agreement-identifier)) ERROR_AGREEMENT_ALREADY_EXISTS)
         (asserts! (> total-service-cost u0) ERROR_INSUFFICIENT_PAYMENT)
+        (asserts! (> agreement-duration u0) ERROR_INVALID_INPUT)
+        (asserts! (validate-service-provider service-provider-address) ERROR_INVALID_SERVICE_PROVIDER)
+        (asserts! (validate-milestone-payments service-milestones total-service-cost) ERROR_INVALID_MILESTONE_DATA)
         
         (map-set service-agreement-details
             { agreement-identifier: agreement-identifier }
@@ -158,23 +196,26 @@
         
         (asserts! (is-eq tx-sender (get client-address agreement-info)) ERROR_UNAUTHORIZED_ACCESS)
         (asserts! (is-eq (get agreement-status agreement-info) agreement-status-awaiting-payment) ERROR_INVALID_AGREEMENT_STATUS)
+        (asserts! (> payment-amount u0) ERROR_INVALID_INPUT)
         
         (try! (stx-transfer? payment-amount tx-sender (as-contract tx-sender)))
         
-        (map-set agreement-payment-escrow
-            { agreement-identifier: agreement-identifier }
-            { escrowed-amount: (+ current-escrow-balance payment-amount) }
-        )
-        
-        (if (>= (+ current-escrow-balance payment-amount) (get total-service-cost agreement-info))
-            (map-set service-agreement-details
+        (let ((new-escrow-balance (+ current-escrow-balance payment-amount)))
+            (map-set agreement-payment-escrow
                 { agreement-identifier: agreement-identifier }
-                (merge agreement-info { agreement-status: agreement-status-active })
+                { escrowed-amount: new-escrow-balance }
             )
-            true
+            
+            (if (>= new-escrow-balance (get total-service-cost agreement-info))
+                (map-set service-agreement-details
+                    { agreement-identifier: agreement-identifier }
+                    (merge agreement-info { agreement-status: agreement-status-active })
+                )
+                true
+            )
+            
+            (ok true)
         )
-        
-        (ok true)
     )
 )
 
@@ -241,6 +282,7 @@
     (let ((agreement-info (unwrap! (get-agreement-details agreement-identifier) ERROR_AGREEMENT_NOT_FOUND)))
         (asserts! (verify-participant-authorization agreement-identifier) ERROR_UNAUTHORIZED_ACCESS)
         (asserts! (< block-height (get dispute-filing-deadline-block agreement-info)) ERROR_INVALID_AGREEMENT_STATUS)
+        (asserts! (> (len dispute-reason) u0) ERROR_INVALID_INPUT)
         
         (map-set agreement-disputes
             { agreement-identifier: agreement-identifier }
@@ -268,7 +310,8 @@
         
         (asserts! (is-eq tx-sender contract-administrator) ERROR_UNAUTHORIZED_ACCESS)
         (asserts! (is-eq (get agreement-status agreement-info) agreement-status-under-dispute) ERROR_INVALID_AGREEMENT_STATUS)
-        (asserts! (<= client-refund-percentage u100) ERROR_INVALID_AGREEMENT_STATUS)
+        (asserts! (<= client-refund-percentage u100) ERROR_INVALID_INPUT)
+        (asserts! (> (len resolution-details) u0) ERROR_INVALID_INPUT)
         
         (let ((client-refund-amount (/ (* (get escrowed-amount escrow-info) client-refund-percentage) u100))
               (provider-payment-amount (- (get escrowed-amount escrow-info) client-refund-amount)))
