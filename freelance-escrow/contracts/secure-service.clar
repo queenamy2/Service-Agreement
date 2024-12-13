@@ -10,7 +10,7 @@
 (define-constant agreement-status-terminated u3)
 (define-constant agreement-status-under-dispute u4)
 
-;; Error constants in uppercase following standard convention
+;; Error constants
 (define-constant ERROR_UNAUTHORIZED_ACCESS (err u100))
 (define-constant ERROR_INVALID_AGREEMENT_STATUS (err u101))
 (define-constant ERROR_INSUFFICIENT_PAYMENT (err u102))
@@ -26,9 +26,9 @@
         client-address: principal,
         total-service-cost: uint,
         agreement-status: uint,
-        agreement-start-timestamp: uint,
-        agreement-end-timestamp: uint,
-        dispute-filing-deadline: uint,
+        agreement-start-block: uint,
+        agreement-end-block: uint,
+        dispute-filing-deadline-block: uint,
         service-milestones: (list 5 {
             milestone-description: (string-utf8 100),
             milestone-payment: uint,
@@ -77,12 +77,42 @@
     )
 )
 
+(define-private (milestone-completed? (milestone {
+    milestone-description: (string-utf8 100),
+    milestone-payment: uint,
+    milestone-completed: bool
+}))
+    (get milestone-completed milestone))
+
 (define-private (verify-all-milestones-complete (service-milestones (list 5 {
         milestone-description: (string-utf8 100),
         milestone-payment: uint,
         milestone-completed: bool
     })))
-    (fold and true (map get milestone-completed service-milestones))
+    (and
+        (milestone-completed? (unwrap-panic (element-at service-milestones u0)))
+        (milestone-completed? (unwrap-panic (element-at service-milestones u1)))
+        (milestone-completed? (unwrap-panic (element-at service-milestones u2)))
+        (milestone-completed? (unwrap-panic (element-at service-milestones u3)))
+        (milestone-completed? (unwrap-panic (element-at service-milestones u4)))
+    )
+)
+
+(define-private (update-milestone-at-index 
+    (milestone {
+        milestone-description: (string-utf8 100),
+        milestone-payment: uint,
+        milestone-completed: bool
+    })
+    (target-index uint)
+    (index uint))
+    {
+        milestone-description: (get milestone-description milestone),
+        milestone-payment: (get milestone-payment milestone),
+        milestone-completed: (if (is-eq index target-index) 
+                               true 
+                               (get milestone-completed milestone))
+    }
 )
 
 ;; Public functions
@@ -95,7 +125,7 @@
                                            milestone-payment: uint,
                                            milestone-completed: bool
                                        })))
-    (let ((current-timestamp (get-block-time)))
+    (let ((current-block block-height))
         (asserts! (is-none (get-agreement-details agreement-identifier)) ERROR_AGREEMENT_ALREADY_EXISTS)
         (asserts! (> total-service-cost u0) ERROR_INSUFFICIENT_PAYMENT)
         
@@ -106,9 +136,9 @@
                 client-address: tx-sender,
                 total-service-cost: total-service-cost,
                 agreement-status: agreement-status-awaiting-payment,
-                agreement-start-timestamp: current-timestamp,
-                agreement-end-timestamp: (+ current-timestamp agreement-duration),
-                dispute-filing-deadline: (+ (+ current-timestamp agreement-duration) u604800), ;; 7 days after end
+                agreement-start-block: current-block,
+                agreement-end-block: (+ current-block agreement-duration),
+                dispute-filing-deadline-block: (+ (+ current-block agreement-duration) u144), ;; ~1 day after end (assuming ~10min blocks)
                 service-milestones: service-milestones
             }
         )
@@ -154,9 +184,16 @@
         (asserts! (is-eq (get agreement-status agreement-info) agreement-status-active) ERROR_INVALID_AGREEMENT_STATUS)
         (asserts! (< milestone-index (len (get service-milestones agreement-info))) ERROR_INVALID_MILESTONE_INDEX)
         
-        (let ((updated-service-milestones (map-set-entry (get service-milestones agreement-info)
-                                                        milestone-index
-                                                        { milestone-completed: true })))
+        (let ((milestones (get service-milestones agreement-info))
+              (updated-service-milestones 
+                (list 
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u0)) milestone-index u0)
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u1)) milestone-index u1)
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u2)) milestone-index u2)
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u3)) milestone-index u3)
+                    (update-milestone-at-index (unwrap-panic (element-at milestones u4)) milestone-index u4)
+                )))
+            
             (map-set service-agreement-details
                 { agreement-identifier: agreement-identifier }
                 (merge agreement-info { service-milestones: updated-service-milestones })
@@ -203,7 +240,7 @@
 (define-public (initiate-dispute (agreement-identifier uint) (dispute-reason (string-utf8 200)))
     (let ((agreement-info (unwrap! (get-agreement-details agreement-identifier) ERROR_AGREEMENT_NOT_FOUND)))
         (asserts! (verify-participant-authorization agreement-identifier) ERROR_UNAUTHORIZED_ACCESS)
-        (asserts! (< (get-block-time) (get dispute-filing-deadline agreement-info)) ERROR_INVALID_AGREEMENT_STATUS)
+        (asserts! (< block-height (get dispute-filing-deadline-block agreement-info)) ERROR_INVALID_AGREEMENT_STATUS)
         
         (map-set agreement-disputes
             { agreement-identifier: agreement-identifier }
@@ -257,10 +294,11 @@
             )
             
             ;; Update dispute resolution
-            (map-set agreement-disputes
-                { agreement-identifier: agreement-identifier }
-                (merge (unwrap! (get-dispute-details agreement-identifier) (tuple))
-                    { dispute-resolution: (some resolution-details) })
+            (let ((dispute-details (unwrap! (get-dispute-details agreement-identifier) ERROR_AGREEMENT_NOT_FOUND)))
+                (map-set agreement-disputes
+                    { agreement-identifier: agreement-identifier }
+                    (merge dispute-details { dispute-resolution: (some resolution-details) })
+                )
             )
             
             ;; Clear escrow and update status
